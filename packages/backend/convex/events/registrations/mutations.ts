@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internal } from "../../_generated/api";
+import { api, internal } from "../../_generated/api";
 import { mutation } from "../../_generated/server";
 import { getCurrentUserOrThrow } from "../../auth/currentUser";
 import { makeStatusPending } from "../waitlist/mutations";
@@ -61,13 +61,15 @@ export const updateAttendance = mutation({
             );
         }
 
+        const effectiveStatus = registration.status === "pending" ? "registered" : registration.status;
+
         await ctx.db.patch(id, {
             attendanceStatus: newStatus,
             attendanceTime: Date.now(),
-            status: registration.status === "pending" ? "registered" : registration.status,
+            status: effectiveStatus,
         });
 
-        if (registration.status !== "registered") return;
+        if (effectiveStatus !== "registered") return;
 
         const student = await ctx.db
             .query("students")
@@ -166,7 +168,18 @@ export const updateNote = mutation({
         note: v.optional(v.string()),
     },
     handler: async (ctx, { id, note }) => {
-        await getCurrentUserOrThrow(ctx);
+        const user = await getCurrentUserOrThrow(ctx);
+
+        const registration = await ctx.db.get(id);
+        if (!registration) {
+            throw new Error(`Registrering med ID ${id} ikke funnet. Kan ikke oppdatere notat.`);
+        }
+
+        if (registration.userId !== user._id) {
+            throw new Error(
+                `Registrering med ID ${id} tilhører ikke brukeren. Kan ikke oppdatere notat.`,
+            );
+        }
 
         await ctx.db.patch(id, { note });
     },
@@ -190,6 +203,17 @@ export const unregister = mutation({
         const registration = await ctx.db.get(id);
         if (!registration) {
             throw new Error(`Registrering med ID ${id} ble ikke funnet. Avbryter avregistrering.`);
+        }
+
+        if (registration.userId !== currentUser._id) {
+            const hasStaffRights = await ctx.runQuery(api.auth.accessRights.checkRights, {
+                right: ["super-admin", "admin", "editor"],
+            });
+            if (!hasStaffRights) {
+                throw new Error(
+                    `Registrering med ID ${id} tilhører ikke brukeren. Avbryter avregistrering.`,
+                );
+            }
         }
 
         const event = await ctx.db.get(registration.eventId);

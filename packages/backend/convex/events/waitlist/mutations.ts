@@ -57,6 +57,23 @@ export const updateWaitlistMutation = internalMutation({
 });
 
 /**
+ * Fetches an event's waitlisted registrations, oldest first.
+ *
+ * @param {MutationCtx} ctx - The Convex mutation context.
+ * @param {Id<"events">} eventId - The id of the event to inspect.
+ *
+ * @returns {Promise<Doc<"registrations">[]>} - The waitlisted registrations, ordered oldest first.
+ */
+const getOrderedWaitlist = (ctx: MutationCtx, eventId: Id<"events">) =>
+    ctx.db
+        .query("registrations")
+        .withIndex("by_eventIdStatusAndRegistrationTime", (q) =>
+            q.eq("eventId", eventId).eq("status", "waitlist"),
+        )
+        .order("asc")
+        .collect();
+
+/**
  * Promotes waitlisted registrations into pending status.
  *
  * @param {MutationCtx} ctx - The Convex mutation context.
@@ -71,18 +88,14 @@ export const updateWaitlist = async (
     eventId: Id<"events">,
     numOfNewPlaces: number,
 ) => {
-    const waitlistRegistrations = await ctx.db
-        .query("registrations")
-        .withIndex("by_eventIdStatusAndRegistrationTime", (q) =>
-            q.eq("eventId", eventId).eq("status", "waitlist"),
-        )
-        .order("asc")
-        .collect();
+    if (numOfNewPlaces <= 0) return;
 
     const event = await ctx.db.get(eventId);
     if (!event) {
-        throw new Error(`Event not for eventId: ${eventId}`);
+        throw new Error(`Event not found for eventId: ${eventId}`);
     }
+
+    const waitlistRegistrations = await getOrderedWaitlist(ctx, eventId);
 
     await Promise.all(
         waitlistRegistrations
@@ -135,33 +148,43 @@ export const checkPendingRegistrations = internalMutation({
             )
         ).flat();
 
-        // Check and update all the pending registrations that have been pending for more than 16 hours.
+        // Group the expired pending registrations by event, so each event's freed
+        // seats are offered sequentially and never re-offered to a just-demoted registration.
+        const expiredByEvent = new Map<Id<"events">, Doc<"registrations">[]>();
+        for (const registration of pendingRegistrations) {
+            if (now - registration.registrationTime > ANSWER_TIME_LIMIT_MS) {
+                const expired = expiredByEvent.get(registration.eventId) ?? [];
+                expired.push(registration);
+                expiredByEvent.set(registration.eventId, expired);
+            }
+        }
+
         await Promise.all(
-            pendingRegistrations.map(async (registration) => {
-                if (now - registration.registrationTime > ANSWER_TIME_LIMIT_MS) {
-                    // Move to the back of the waitlist
-                    await ctx.db.patch(registration._id, {
-                        status: "waitlist",
-                        registrationTime: now,
-                    });
+            Array.from(expiredByEvent.entries()).map(async ([eventId, expiredRegistrations]) => {
+                const event = eventsWithOpenRegistrations.find((e) => e._id === eventId);
+                if (!event) throw new Error("Ingen arrangement assosiert med registreringen.");
 
-                    // Find the next on the waitlist to be offered a place
-                    const nextRegistration = await ctx.db
-                        .query("registrations")
-                        .withIndex("by_eventIdStatusAndRegistrationTime", (q) =>
-                            q.eq("eventId", registration.eventId).eq("status", "waitlist"),
-                        )
-                        .order("asc")
-                        .first();
+                // Move all expired registrations to the back of the waitlist.
+                await Promise.all(
+                    expiredRegistrations.map((registration) =>
+                        ctx.db.patch(registration._id, {
+                            status: "waitlist",
+                            registrationTime: now,
+                        }),
+                    ),
+                );
 
-                    if (!nextRegistration) return;
-                    const event = eventsWithOpenRegistrations.find(
-                        (e) => e._id === registration.eventId,
-                    );
-                    if (!event)
-                        throw new Error("Ingen arrangement assosiert med registreringen.");
+                const justDemoted = new Set(
+                    expiredRegistrations.map((registration) => registration._id),
+                );
 
-                    await makeStatusPending(ctx, nextRegistration, event);
+                const waitlistCandidates = (await getOrderedWaitlist(ctx, eventId)).filter(
+                    (registration) => !justDemoted.has(registration._id),
+                );
+
+                // Offer freed seats sequentially so each one goes to a distinct registration.
+                for (const candidate of waitlistCandidates.slice(0, expiredRegistrations.length)) {
+                    await makeStatusPending(ctx, candidate, event);
                 }
             }),
         );
@@ -204,14 +227,12 @@ export const clearWaitlistAndPending = internalMutation({
             }),
         );
 
-        console.log(registrationsForEvents);
-
         await Promise.all(
             registrationsForEvents.map(async ({ event, registrations }) => {
                 const availablePlaces =
                     event.participationLimit -
                     registrations.filter((reg) => reg.status === "registered").length;
-                if (availablePlaces === 0) return;
+                if (availablePlaces <= 0) return;
 
                 // Delete and notify the students on the waitlist
                 await Promise.all(
