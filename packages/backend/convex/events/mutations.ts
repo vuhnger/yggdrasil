@@ -181,9 +181,8 @@ export const upsertEventOrganizer = internalMutation({
             })
             .map((org) => {
                 const existing = eventOrganizers.find((eOrg) => eOrg.userId === org.userId);
-                if (existing) {
-                    ctx.db.patch(existing._id, { role: org.role });
-                }
+                if (!existing) return;
+                return ctx.db.patch(existing._id, { role: org.role });
             });
 
         await Promise.all([...organizersToRemove, ...organizersToAdd, ...organizersToUpdate]);
@@ -320,7 +319,7 @@ export const create = mutation({
         // Creating the feedback form for after the event
         const formId = await ctx.runMutation(internal.forms.mutations.createEventFeedbackForm);
         if (!formId) {
-            console.error("Failed to create feedback form");
+            throw new Error("Failed to create feedback form. Event was not created.");
         }
 
         const eventId = await ctx.db.insert("events", {
